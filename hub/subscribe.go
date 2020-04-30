@@ -251,6 +251,7 @@ func (h *Hub) dispatchSubscriptionUpdate(topics, encodedTopics []string, connect
 			connection.mercureClaim.Publish = []string{}
 			connection.mercureClaim.Subscribe = []string{}
 		} else {
+			connection.mercureClaim = claims.Mercure
 			if connection.mercureClaim.Publish == nil {
 				connection.mercureClaim.Publish = []string{}
 			}

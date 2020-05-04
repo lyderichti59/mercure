@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
-	"time"
 
 	bolt "go.etcd.io/bbolt"
 	"go.uber.org/atomic"
@@ -22,19 +21,17 @@ const defaultBoltBucketName = "updates"
 // BoltTransport implements the TransportInterface using the Bolt database.
 type BoltTransport struct {
 	sync.Mutex
-	db                *bolt.DB
-	bucketName        string
-	size              uint64
-	cleanupFrequency  float64
-	pipes             map[*Pipe]struct{}
-	done              chan struct{}
-	lastSeq           atomic.Uint64
-	bufferSize        int
-	bufferFullTimeout time.Duration
+	db               *bolt.DB
+	bucketName       string
+	size             uint64
+	cleanupFrequency float64
+	subscribers      map[*Subscriber]struct{}
+	done             chan struct{}
+	lastSeq          atomic.Uint64
 }
 
 // NewBoltTransport create a new BoltTransport.
-func NewBoltTransport(u *url.URL, bufferSize int, bufferFullTimeout time.Duration) (*BoltTransport, error) {
+func NewBoltTransport(u *url.URL) (*BoltTransport, error) {
 	var err error
 	q := u.Query()
 	bucketName := defaultBoltBucketName
@@ -76,14 +73,13 @@ func NewBoltTransport(u *url.URL, bufferSize int, bufferFullTimeout time.Duratio
 		bucketName:       bucketName,
 		size:             size,
 		cleanupFrequency: cleanupFrequency,
-		pipes:            make(map[*Pipe]struct{}), done: make(chan struct{}),
-		bufferSize:        bufferSize,
-		bufferFullTimeout: bufferFullTimeout,
+		subscribers:      make(map[*Subscriber]struct{}),
+		done:             make(chan struct{}),
 	}, nil
 }
 
-// Write pushes updates in the Transport.
-func (t *BoltTransport) Write(update *Update) error {
+// Dispatch dispatches an update to all subscribers and persists it in BoltDB.
+func (t *BoltTransport) Dispatch(update *Update) error {
 	select {
 	case <-t.done:
 		return ErrClosedTransport
@@ -103,9 +99,9 @@ func (t *BoltTransport) Write(update *Update) error {
 		return err
 	}
 
-	for pipe := range t.pipes {
-		if !pipe.Write(update) {
-			delete(t.pipes, pipe)
+	for subscriber := range t.subscribers {
+		if subscriber.Dispatch(update, false) == ErrSubscriberDisconnected {
+			delete(t.subscribers, subscriber)
 		}
 	}
 
@@ -141,31 +137,31 @@ func (t *BoltTransport) persist(updateID string, updateJSON []byte) error {
 	})
 }
 
-// CreatePipe returns a pipe fetching updates from the given point in time.
-func (t *BoltTransport) CreatePipe(fromID string) (*Pipe, error) {
+// AddSubscriber adds a new subscriber to the transport.
+func (t *BoltTransport) AddSubscriber(s *Subscriber) error {
 	t.Lock()
 	defer t.Unlock()
 
 	select {
 	case <-t.done:
-		return nil, ErrClosedTransport
+		return ErrClosedTransport
 	default:
 	}
 
-	pipe := NewPipe(t.bufferSize, t.bufferFullTimeout)
-	t.pipes[pipe] = struct{}{}
-	if fromID == "" {
-		return pipe, nil
+	t.subscribers[s] = struct{}{}
+	if s.LastEventID == "" {
+		return nil
 	}
 
 	toSeq := t.lastSeq.Load()
-	go t.fetch(fromID, toSeq, pipe)
+	t.dispatchFromHistory(s.LastEventID, toSeq, s)
 
-	return pipe, nil
+	return nil
 }
 
-func (t *BoltTransport) fetch(fromID string, toSeq uint64, pipe *Pipe) {
-	err := t.db.View(func(tx *bolt.Tx) error {
+func (t *BoltTransport) dispatchFromHistory(lastEventID string, toSeq uint64, s *Subscriber) {
+	t.db.View(func(tx *bolt.Tx) error {
+		defer close(s.HistorySrc.In)
 		b := tx.Bucket([]byte(t.bucketName))
 		if b == nil {
 			return nil // No data
@@ -175,7 +171,7 @@ func (t *BoltTransport) fetch(fromID string, toSeq uint64, pipe *Pipe) {
 		afterFromID := false
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			if !afterFromID {
-				if string(k[8:]) == fromID {
+				if string(k[8:]) == lastEventID {
 					afterFromID = true
 				}
 
@@ -184,19 +180,17 @@ func (t *BoltTransport) fetch(fromID string, toSeq uint64, pipe *Pipe) {
 
 			var update *Update
 			if err := json.Unmarshal(v, &update); err != nil {
+				log.Error(fmt.Errorf("bolt history: %w", err))
 				return err
 			}
 
-			if !pipe.Write(update) || (toSeq > 0 && binary.BigEndian.Uint64(k[:8]) >= toSeq) {
+			if s.Dispatch(update, true) == ErrSubscriberDisconnected || (toSeq > 0 && binary.BigEndian.Uint64(k[:8]) >= toSeq) {
 				return nil
 			}
 		}
 
 		return nil
 	})
-	if err != nil {
-		log.Error(fmt.Errorf("bolt history: %w", err))
-	}
 }
 
 // Close closes the Transport.
@@ -209,8 +203,9 @@ func (t *BoltTransport) Close() error {
 
 	t.Lock()
 	defer t.Unlock()
-	for pipe := range t.pipes {
-		close(pipe.Read())
+	for subscriber := range t.subscribers {
+		close(subscriber.ServerDisconnect)
+		delete(t.subscribers, subscriber)
 	}
 	close(t.done)
 	t.db.Close()

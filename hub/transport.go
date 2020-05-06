@@ -21,7 +21,7 @@ type Transport interface {
 	Close() error
 }
 
-// ErrClosedTransport is returned by the Transport's Write and CreatePipe methods after a call to Close.
+// ErrClosedTransport is returned by the Transport's Dispatch and AddSubscriber methods after a call to Close.
 var ErrClosedTransport = errors.New("hub: read/write on closed Transport")
 
 // NewTransport create a transport using the backend matching the given TransportURL.
@@ -108,7 +108,7 @@ func (t *LocalTransport) Close() error {
 	t.RLock()
 	defer t.RUnlock()
 	for subscriber := range t.subscribers {
-		close(subscriber.ServerDisconnect)
+		subscriber.Disconnect()
 		delete(t.subscribers, subscriber)
 	}
 	close(t.done)
